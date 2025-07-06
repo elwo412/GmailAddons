@@ -64,7 +64,7 @@ class GmailClient:
                     self.config.gmail_credentials_file, 
                     self.config.gmail_scopes
                 )
-                creds = flow.run_local_server(port=0)
+                creds = flow.run_local_server(port=8080)
                 logger.info("Completed OAuth flow with new credentials")
             
             # Save the credentials for the next run
@@ -264,10 +264,6 @@ class GmailClient:
             logger.error(f"Failed to fetch labels: {error}")
             raise
     
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=4, max=10)
-    )
     def create_label(self, name: str, description: str = "") -> GmailLabel:
         """
         Create a new Gmail label.

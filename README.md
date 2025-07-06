@@ -86,7 +86,7 @@ The application uses environment variables with the prefix `GMAIL_GPT_`. Key con
 
 ### OpenAI Settings
 
-- `GMAIL_GPT_OPENAI_MODEL`: Model to use (default: `gpt-4`)
+- `GMAIL_GPT_OPENAI_MODEL`: Model to use (default: `gpt-4o-mini`)
 - `GMAIL_GPT_OPENAI_MAX_TOKENS`: Max response tokens (default: 150)
 - `GMAIL_GPT_OPENAI_TEMPERATURE`: Temperature setting (default: 0.3)
 

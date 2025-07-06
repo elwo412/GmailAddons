@@ -4,7 +4,8 @@ import os
 from pathlib import Path
 from typing import List, Optional
 
-from pydantic import BaseSettings, Field, validator
+from pydantic import Field, validator
+from pydantic_settings import BaseSettings
 
 
 class Config(BaseSettings):
@@ -30,7 +31,7 @@ class Config(BaseSettings):
         description="OpenAI API key for GPT integration"
     )
     openai_model: str = Field(
-        default="gpt-4",
+        default="gpt-4o-mini",
         description="OpenAI model to use for categorization"
     )
     openai_max_tokens: int = Field(

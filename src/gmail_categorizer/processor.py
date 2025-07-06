@@ -195,30 +195,38 @@ class EmailProcessor:
         if not self._label_cache:
             self._build_label_cache()
         
+        # Group results by category to minimize label creation calls
+        category_groups = {}
         for result in results:
             if not result.success:
                 continue
-            
-            category_name = result.predicted_category.name
             
             # Skip if confidence is too low
             if result.predicted_category.confidence and result.predicted_category.confidence < 0.3:
                 logger.debug(f"Skipping label application for {result.message_id} due to low confidence")
                 continue
             
-            # Get or create label
+            category_name = result.predicted_category.name
+            if category_name not in category_groups:
+                category_groups[category_name] = []
+            category_groups[category_name].append(result)
+        
+        # Process each category group
+        for category_name, category_results in category_groups.items():
+            # Get or create label once per category
             label_id = self._get_or_create_label(category_name)
             if not label_id:
                 logger.warning(f"Could not get/create label for category: {category_name}")
                 continue
             
-            # Apply label to message
-            success = self.gmail_client.add_label_to_message(result.message_id, label_id)
-            if success:
-                logger.debug(f"Applied label '{category_name}' to message {result.message_id}")
-                self._stats.api_calls_gmail += 1
-            else:
-                logger.warning(f"Failed to apply label to message {result.message_id}")
+            # Apply label to all messages in this category
+            for result in category_results:
+                success = self.gmail_client.add_label_to_message(result.message_id, label_id)
+                if success:
+                    logger.debug(f"Applied label '{category_name}' to message {result.message_id}")
+                    self._stats.api_calls_gmail += 1
+                else:
+                    logger.warning(f"Failed to apply label to message {result.message_id}")
     
     def _build_label_cache(self) -> None:
         """Build cache of category names to Gmail label IDs."""
@@ -228,9 +236,15 @@ class EmailProcessor:
             labels = self.gmail_client.get_labels()
             self._stats.api_calls_gmail += 1
             
+            # Clear and rebuild cache completely
+            new_cache = {}
             for label in labels:
-                if label.name in self.config.categories:
-                    self._label_cache[label.name] = label.id
+                # Check all configured categories plus any that might have been created
+                if label.name in self.config.categories or label.type == 'user':
+                    new_cache[label.name] = label.id
+            
+            # Update the cache
+            self._label_cache.update(new_cache)
             
             logger.debug(f"Built label cache with {len(self._label_cache)} existing labels")
             
@@ -240,6 +254,11 @@ class EmailProcessor:
     def _get_or_create_label(self, category_name: str) -> Optional[str]:
         """Get existing label ID or create new label for category."""
         # Check cache first
+        if category_name in self._label_cache:
+            return self._label_cache[category_name]
+        
+        # Refresh cache to check if label was created by another process
+        self._build_label_cache()
         if category_name in self._label_cache:
             return self._label_cache[category_name]
         
@@ -257,6 +276,14 @@ class EmailProcessor:
             return label.id
             
         except Exception as error:
+            # Check if it's a "label already exists" error
+            if "409" in str(error) or "exists" in str(error).lower():
+                logger.info(f"Label {category_name} already exists, refreshing cache...")
+                # Refresh cache and try to find the existing label
+                self._build_label_cache()
+                if category_name in self._label_cache:
+                    return self._label_cache[category_name]
+            
             logger.error(f"Failed to create label for {category_name}: {error}")
             return None
     

@@ -88,16 +88,32 @@ Rules:
             system_prompt = self._build_system_prompt()
             user_prompt = self._build_user_prompt(email)
             
-            response = self.client.chat.completions.create(
-                model=self.config.openai_model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                max_tokens=self.config.openai_max_tokens,
-                temperature=self.config.openai_temperature,
-                response_format={"type": "json_object"}
-            )
+            # Try with JSON response format first, fall back if not supported
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.config.openai_model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    max_tokens=self.config.openai_max_tokens,
+                    temperature=self.config.openai_temperature,
+                    response_format={"type": "json_object"}
+                )
+            except Exception as json_error:
+                if "response_format" in str(json_error):
+                    logger.warning(f"Model {self.config.openai_model} doesn't support JSON format, using text mode")
+                    response = self.client.chat.completions.create(
+                        model=self.config.openai_model,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt}
+                        ],
+                        max_tokens=self.config.openai_max_tokens,
+                        temperature=self.config.openai_temperature
+                    )
+                else:
+                    raise json_error
             
             # Parse response
             response_text = response.choices[0].message.content.strip()
