@@ -30,6 +30,7 @@ class EmailProcessor:
         
         # Cache for Gmail labels
         self._label_cache: Dict[str, str] = {}  # category_name -> label_id
+        self._label_lookup_cache: Dict[str, str] = {}  # label_id -> label_name
         self._stats = ProcessingStats(start_time=datetime.now())
         
         logger.info("Email processor initialized successfully")
@@ -60,6 +61,9 @@ class EmailProcessor:
         logger.info(f"Starting email processing: query='{query}', max_messages={max_messages}")
         
         try:
+            # Step 0: Build label caches for efficient lookup
+            self._build_label_lookup_cache()
+            
             # Step 1: Fetch message IDs
             logger.info("Fetching message IDs...")
             message_ids = self.gmail_client.get_message_ids(query, max_messages)
@@ -174,16 +178,13 @@ class EmailProcessor:
             )
     
     def _get_current_category(self, email: EmailMessage) -> Optional[str]:
-        """Extract current category from email labels."""
+        """Extract current category from email labels using cached lookup."""
         if not email.labels:
             return None
         
-        # Check if any current labels match our categories
-        all_labels = self.gmail_client.get_labels()
-        label_map = {label.id: label.name for label in all_labels}
-        
+        # Use cached label lookup instead of calling get_labels() for every email
         for label_id in email.labels:
-            label_name = label_map.get(label_id, "")
+            label_name = self._label_lookup_cache.get(label_id, "")
             if label_name in self.config.categories:
                 return label_name
         
@@ -228,6 +229,24 @@ class EmailProcessor:
                 else:
                     logger.warning(f"Failed to apply label to message {result.message_id}")
     
+    def _build_label_lookup_cache(self) -> None:
+        """Build cache for label ID to name lookup."""
+        logger.debug("Building label lookup cache...")
+        
+        try:
+            labels = self.gmail_client.get_labels()
+            self._stats.api_calls_gmail += 1
+            
+            # Clear and rebuild lookup cache
+            self._label_lookup_cache.clear()
+            for label in labels:
+                self._label_lookup_cache[label.id] = label.name
+            
+            logger.debug(f"Built label lookup cache with {len(self._label_lookup_cache)} labels")
+            
+        except Exception as error:
+            logger.error(f"Failed to build label lookup cache: {error}")
+    
     def _build_label_cache(self) -> None:
         """Build cache of category names to Gmail label IDs."""
         logger.debug("Building label cache...")
@@ -268,7 +287,13 @@ class EmailProcessor:
                 name=category_name,
                 description=f"Auto-generated label for {category_name} emails"
             )
+            # Update both caches with the new label
             self._label_cache[category_name] = label.id
+            self._label_lookup_cache[label.id] = label.name
+            
+            # Invalidate Gmail client cache so it refreshes on next call
+            self.gmail_client._labels_cache = None
+            
             self._stats.categories_created += 1
             self._stats.api_calls_gmail += 1
             
@@ -279,7 +304,8 @@ class EmailProcessor:
             # Check if it's a "label already exists" error
             if "409" in str(error) or "exists" in str(error).lower():
                 logger.info(f"Label {category_name} already exists, refreshing cache...")
-                # Refresh cache and try to find the existing label
+                # Force refresh Gmail client cache and rebuild our caches
+                self.gmail_client._labels_cache = None
                 self._build_label_cache()
                 if category_name in self._label_cache:
                     return self._label_cache[category_name]

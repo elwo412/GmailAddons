@@ -20,14 +20,20 @@ from .models import EmailMessage, EmailHeader, GmailLabel
 
 
 class GmailClient:
-    """Gmail API client with authentication and message management."""
+    """Gmail API client with authentication and retry logic."""
     
     def __init__(self, config: Config):
-        """Initialize Gmail client with configuration."""
         self.config = config
         self.service = None
-        self.credentials = None
+        self.creds = None
+        self._labels_cache = None  # Cache for labels
+        self._labels_cache_time = 0  # Cache timestamp
+        self._cache_ttl = 300  # 5 minutes cache TTL
+        
+        # Initialize Gmail service
         self._authenticate()
+        
+        logger.info("Gmail client initialized successfully")
     
     def _authenticate(self) -> None:
         """Authenticate with Gmail API using OAuth 2.0."""
@@ -72,7 +78,7 @@ class GmailClient:
                 token.write(creds.to_json())
                 logger.info(f"Saved credentials to {self.config.gmail_token_file}")
         
-        self.credentials = creds
+        self.creds = creds
         self.service = build('gmail', 'v1', credentials=creds)
         logger.info("Gmail API client initialized successfully")
     
@@ -239,10 +245,29 @@ class GmailClient:
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=4, max=10)
     )
-    def get_labels(self) -> List[GmailLabel]:
-        """Get all Gmail labels."""
+    def get_labels(self, force_refresh: bool = False) -> List[GmailLabel]:
+        """
+        Get all Gmail labels with caching.
+        
+        Args:
+            force_refresh: Force refresh of cache, bypassing TTL
+            
+        Returns:
+            List of GmailLabel objects
+        """
+        import time
+        
+        current_time = time.time()
+        
+        # Check if we can use cached labels
+        if (not force_refresh and 
+            self._labels_cache is not None and 
+            current_time - self._labels_cache_time < self._cache_ttl):
+            logger.debug(f"Using cached labels ({len(self._labels_cache)} labels)")
+            return self._labels_cache
+        
         try:
-            logger.debug("Fetching Gmail labels")
+            logger.debug("Fetching Gmail labels from API")
             
             result = self.service.users().labels().list(userId='me').execute()
             labels = result.get('labels', [])
@@ -257,7 +282,11 @@ class GmailClient:
                     messages_unread=label.get('messagesUnread')
                 ))
             
-            logger.info(f"Found {len(gmail_labels)} labels")
+            # Update cache
+            self._labels_cache = gmail_labels
+            self._labels_cache_time = current_time
+            
+            logger.info(f"Found {len(gmail_labels)} labels (cached)")
             return gmail_labels
             
         except HttpError as error:
