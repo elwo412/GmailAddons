@@ -1,5 +1,6 @@
 """Main email processing orchestrator."""
 
+import asyncio
 import time
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
@@ -141,6 +142,163 @@ class EmailProcessor:
                 processing_time=time.time() - start_time,
                 errors=[str(error)]
             )
+    
+    async def process_emails_concurrent(
+        self, 
+        query: Optional[str] = None,
+        max_messages: Optional[int] = None,
+        apply_labels: bool = True,
+        max_concurrent: int = 5
+    ) -> BatchProcessingResult:
+        """
+        Process emails concurrently: fetch, categorize, and optionally apply labels.
+        
+        Args:
+            query: Gmail search query (uses config default if None)
+            max_messages: Maximum messages to process (uses config default if None)
+            apply_labels: Whether to apply category labels to emails
+            max_concurrent: Maximum number of concurrent categorization calls
+            
+        Returns:
+            BatchProcessingResult with processing summary
+        """
+        start_time = time.time()
+        self._stats = ProcessingStats(start_time=datetime.now())
+        
+        query = query or self.config.gmail_query
+        max_messages = max_messages or self.config.max_messages_per_batch
+        
+        logger.info(f"Starting concurrent email processing: query='{query}', max_messages={max_messages}, max_concurrent={max_concurrent}")
+        
+        try:
+            # Step 0: Build label caches for efficient lookup
+            self._build_label_lookup_cache()
+            
+            # Step 1: Fetch message IDs
+            logger.info("Fetching message IDs...")
+            message_ids = self.gmail_client.get_message_ids(query, max_messages)
+            self._stats.api_calls_gmail += 1
+            
+            if not message_ids:
+                logger.info("No messages found matching query")
+                return self._create_batch_result([], start_time)
+            
+            # Step 2: Fetch detailed message content
+            logger.info(f"Fetching details for {len(message_ids)} messages...")
+            emails = []
+            for message_id in message_ids:
+                try:
+                    email = self.gmail_client.get_message(message_id)
+                    emails.append(email)
+                    self._stats.api_calls_gmail += 1
+                except Exception as error:
+                    logger.error(f"Failed to fetch message {message_id}: {error}")
+                    self._stats.errors.append(f"Failed to fetch {message_id}: {str(error)}")
+            
+            self._stats.messages_processed = len(emails)
+            logger.info(f"Successfully fetched {len(emails)} email messages")
+            
+            if not emails:
+                logger.warning("No emails successfully fetched")
+                return self._create_batch_result([], start_time)
+            
+            # Step 3: Categorize emails using GPT concurrently
+            logger.info("Categorizing emails with GPT (concurrent)...")
+            categorization_results = await self._categorize_emails_concurrent(emails, max_concurrent)
+            
+            # Step 4: Apply labels if requested
+            if apply_labels:
+                logger.info("Applying category labels to emails...")
+                self._apply_labels_to_emails(categorization_results)
+            
+            # Step 5: Generate final results
+            processing_time = time.time() - start_time
+            self._stats.end_time = datetime.now()
+            
+            result = BatchProcessingResult(
+                total_messages=len(emails),
+                successful_categorizations=self._stats.messages_categorized,
+                failed_categorizations=self._stats.messages_failed,
+                processing_time=processing_time,
+                results=categorization_results,
+                errors=self._stats.errors
+            )
+            
+            logger.info(
+                f"Concurrent email processing completed in {processing_time:.2f}s: "
+                f"{result.successful_categorizations}/{result.total_messages} successful"
+            )
+            
+            return result
+            
+        except Exception as error:
+            logger.error(f"Concurrent email processing failed: {error}")
+            self._stats.errors.append(f"Processing failed: {str(error)}")
+            self._stats.end_time = datetime.now()
+            
+            return BatchProcessingResult(
+                total_messages=0,
+                processing_time=time.time() - start_time,
+                errors=[str(error)]
+            )
+    
+    async def _categorize_emails_concurrent(
+        self, 
+        emails: List[EmailMessage], 
+        max_concurrent: int = 5
+    ) -> List[CategorizationResult]:
+        """Categorize emails concurrently and build CategorizationResult objects."""
+        try:
+            # Use the concurrent categorization from GPTCategorizer
+            categories = await self.gpt_categorizer.categorize_emails_concurrent_ordered(
+                emails, max_concurrent
+            )
+            
+            # Build CategorizationResult objects
+            categorization_results = []
+            for i, (email, category) in enumerate(zip(emails, categories)):
+                # Get original category if any
+                original_category = self._get_current_category(email)
+                
+                # Create result object
+                result = CategorizationResult(
+                    message_id=email.id,
+                    original_category=original_category,
+                    predicted_category=category,
+                    processing_time=0.0,  # Individual timing handled in GPTCategorizer
+                    success=category.confidence > 0.0,  # Consider non-zero confidence as success
+                    error_message=None if category.confidence > 0.0 else category.reasoning
+                )
+                
+                categorization_results.append(result)
+                
+                # Update stats
+                if result.success:
+                    self._stats.messages_categorized += 1
+                    self._stats.api_calls_openai += 1
+                else:
+                    self._stats.messages_failed += 1
+                    self._stats.errors.append(result.error_message or "Unknown error")
+            
+            return categorization_results
+            
+        except Exception as error:
+            logger.error(f"Concurrent categorization failed: {error}")
+            # Fallback to sequential processing
+            logger.info("Falling back to sequential categorization...")
+            
+            categorization_results = []
+            for email in emails:
+                result = self._categorize_single_email(email)
+                categorization_results.append(result)
+                
+                if result.success:
+                    self._stats.messages_categorized += 1
+                else:
+                    self._stats.messages_failed += 1
+                    self._stats.errors.append(result.error_message or "Unknown error")
+            
+            return categorization_results
     
     def _categorize_single_email(self, email: EmailMessage) -> CategorizationResult:
         """Categorize a single email and return result."""

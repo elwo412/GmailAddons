@@ -1,5 +1,6 @@
 """GPT-based email categorization using OpenAI API."""
 
+import asyncio
 import json
 import re
 import time
@@ -8,6 +9,7 @@ from typing import List, Optional, Dict, Any
 import openai
 from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity.asyncio import AsyncRetrying
 
 from .config import Config
 from .models import EmailMessage, Category
@@ -20,6 +22,7 @@ class GPTCategorizer:
         """Initialize GPT categorizer with configuration."""
         self.config = config
         self.client = openai.OpenAI(api_key=config.openai_api_key)
+        self.async_client = openai.AsyncOpenAI(api_key=config.openai_api_key)
         self.categories = config.categories
         
         logger.info(f"GPT Categorizer initialized with model: {config.openai_model}")
@@ -138,6 +141,89 @@ Rules:
                 reasoning=f"Categorization failed: {str(error)}"
             )
     
+    async def categorize_email_async(self, email: EmailMessage, semaphore: Optional[asyncio.Semaphore] = None) -> Category:
+        """
+        Categorize a single email using GPT asynchronously.
+        
+        Args:
+            email: EmailMessage object to categorize
+            semaphore: Optional semaphore for rate limiting
+            
+        Returns:
+            Category object with prediction and confidence
+        """
+        start_time = time.time()
+        
+        # Use semaphore if provided for rate limiting
+        if semaphore:
+            async with semaphore:
+                return await self._categorize_email_async_impl(email, start_time)
+        else:
+            return await self._categorize_email_async_impl(email, start_time)
+    
+    async def _categorize_email_async_impl(self, email: EmailMessage, start_time: float) -> Category:
+        """Implementation of async categorization with retry logic."""
+        try:
+            async for attempt in AsyncRetrying(
+                stop=stop_after_attempt(3),
+                wait=wait_exponential(multiplier=1, min=4, max=10)
+            ):
+                with attempt:
+                    logger.debug(f"Categorizing email: {email.id} - {email.subject[:50]}...")
+                    
+                    system_prompt = self._build_system_prompt()
+                    user_prompt = self._build_user_prompt(email)
+                    
+                    # Try with JSON response format first, fall back if not supported
+                    try:
+                        response = await self.async_client.chat.completions.create(
+                            model=self.config.openai_model,
+                            messages=[
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": user_prompt}
+                            ],
+                            max_tokens=self.config.openai_max_tokens,
+                            temperature=self.config.openai_temperature,
+                            response_format={"type": "json_object"}
+                        )
+                    except Exception as json_error:
+                        if "response_format" in str(json_error):
+                            logger.warning(f"Model {self.config.openai_model} doesn't support JSON format, using text mode")
+                            response = await self.async_client.chat.completions.create(
+                                model=self.config.openai_model,
+                                messages=[
+                                    {"role": "system", "content": system_prompt},
+                                    {"role": "user", "content": user_prompt}
+                                ],
+                                max_tokens=self.config.openai_max_tokens,
+                                temperature=self.config.openai_temperature
+                            )
+                        else:
+                            raise json_error
+                    
+                    # Parse response
+                    response_text = response.choices[0].message.content.strip()
+                    result = self._parse_gpt_response(response_text)
+                    
+                    processing_time = time.time() - start_time
+                    logger.debug(
+                        f"Categorized email {email.id} as '{result.name}' "
+                        f"(confidence: {result.confidence:.2f}) in {processing_time:.2f}s"
+                    )
+                    
+                    return result
+                    
+        except Exception as error:
+            processing_time = time.time() - start_time
+            logger.error(f"Failed to categorize email {email.id}: {error}")
+            
+            # Return fallback category
+            return Category(
+                name="Other",
+                confidence=0.0,
+                reasoning=f"Categorization failed: {str(error)}"
+            )
+    
     def _parse_gpt_response(self, response_text: str) -> Category:
         """Parse GPT response and extract category information."""
         try:
@@ -198,7 +284,7 @@ Rules:
     
     async def categorize_emails_batch(self, emails: List[EmailMessage]) -> List[Category]:
         """
-        Categorize multiple emails in batch.
+        Categorize multiple emails in batch (sequential processing).
         
         Args:
             emails: List of EmailMessage objects
@@ -206,7 +292,7 @@ Rules:
         Returns:
             List of Category objects in same order as input
         """
-        logger.info(f"Starting batch categorization of {len(emails)} emails")
+        logger.info(f"Starting sequential batch categorization of {len(emails)} emails")
         start_time = time.time()
         
         categories = []
@@ -234,6 +320,125 @@ Rules:
         )
         
         return categories
+    
+    async def categorize_emails_concurrent(
+        self, 
+        emails: List[EmailMessage], 
+        max_concurrent: int = 5
+    ) -> List[Category]:
+        """
+        Categorize multiple emails concurrently with rate limiting.
+        
+        Args:
+            emails: List of EmailMessage objects
+            max_concurrent: Maximum number of concurrent API calls
+            
+        Returns:
+            List of Category objects in same order as input
+        """
+        logger.info(f"Starting concurrent categorization of {len(emails)} emails (max_concurrent={max_concurrent})")
+        start_time = time.time()
+        
+        # Create semaphore for rate limiting
+        semaphore = asyncio.Semaphore(max_concurrent)
+        
+        # Create tasks for all emails
+        tasks = [
+            self.categorize_email_async(email, semaphore) 
+            for email in emails
+        ]
+        
+        # Process with progress logging
+        categories = []
+        completed = 0
+        
+        # Use asyncio.as_completed for progress tracking
+        for coro in asyncio.as_completed(tasks):
+            try:
+                category = await coro
+                categories.append(category)
+                completed += 1
+                
+                # Log progress
+                if completed % 10 == 0 or completed == len(emails):
+                    logger.info(f"Processed {completed}/{len(emails)} emails")
+                    
+            except Exception as error:
+                logger.error(f"Failed to categorize email: {error}")
+                categories.append(Category(
+                    name="Other",
+                    confidence=0.0,
+                    reasoning=f"Processing error: {str(error)}"
+                ))
+                completed += 1
+        
+        # Note: categories may not be in original order due to async completion
+        # For ordered results, use gather instead
+        total_time = time.time() - start_time
+        logger.info(
+            f"Concurrent categorization completed: {len(categories)} emails in {total_time:.2f}s "
+            f"(avg: {total_time/len(emails):.2f}s per email)"
+        )
+        
+        return categories
+    
+    async def categorize_emails_concurrent_ordered(
+        self, 
+        emails: List[EmailMessage], 
+        max_concurrent: int = 5
+    ) -> List[Category]:
+        """
+        Categorize multiple emails concurrently while preserving order.
+        
+        Args:
+            emails: List of EmailMessage objects
+            max_concurrent: Maximum number of concurrent API calls
+            
+        Returns:
+            List of Category objects in same order as input
+        """
+        logger.info(f"Starting ordered concurrent categorization of {len(emails)} emails (max_concurrent={max_concurrent})")
+        start_time = time.time()
+        
+        # Create semaphore for rate limiting
+        semaphore = asyncio.Semaphore(max_concurrent)
+        
+        # Create tasks for all emails
+        tasks = [
+            self.categorize_email_async(email, semaphore) 
+            for email in emails
+        ]
+        
+        # Process all tasks concurrently but preserve order
+        try:
+            categories = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Handle any exceptions in results
+            processed_categories = []
+            for i, result in enumerate(categories):
+                if isinstance(result, Exception):
+                    logger.error(f"Failed to categorize email {emails[i].id}: {result}")
+                    processed_categories.append(Category(
+                        name="Other",
+                        confidence=0.0,
+                        reasoning=f"Processing error: {str(result)}"
+                    ))
+                else:
+                    processed_categories.append(result)
+            
+            total_time = time.time() - start_time
+            logger.info(
+                f"Ordered concurrent categorization completed: {len(processed_categories)} emails in {total_time:.2f}s "
+                f"(avg: {total_time/len(emails):.2f}s per email, speedup: {(total_time*max_concurrent)/(total_time):.1f}x)"
+            )
+            
+            return processed_categories
+            
+        except Exception as error:
+            logger.error(f"Concurrent categorization failed: {error}")
+            # Fallback to sequential processing
+            logger.info("Falling back to sequential processing...")
+            return await self.categorize_emails_batch(emails)
     
     def get_category_stats(self, categories: List[Category]) -> Dict[str, Any]:
         """

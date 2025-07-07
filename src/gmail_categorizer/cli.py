@@ -1,5 +1,6 @@
 """Command-line interface for Gmail GPT Categorizer."""
 
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -72,8 +73,19 @@ def cli(ctx, log_level: str, log_file: Optional[str]):
     type=click.Path(),
     help="Save results to JSON file"
 )
+@click.option(
+    "--concurrent",
+    is_flag=True,
+    help="Use concurrent processing for faster categorization"
+)
+@click.option(
+    "--max-concurrent",
+    type=int,
+    default=5,
+    help="Maximum number of concurrent API calls (default: 5)"
+)
 @click.pass_context
-def process(ctx, query: Optional[str], max_messages: Optional[int], no_apply_labels: bool, output: Optional[str]):
+def process(ctx, query: Optional[str], max_messages: Optional[int], no_apply_labels: bool, output: Optional[str], concurrent: bool, max_concurrent: int):
     """Process and categorize emails."""
     config: Config = ctx.obj['config']
     
@@ -84,11 +96,29 @@ def process(ctx, query: Optional[str], max_messages: Optional[int], no_apply_lab
         
         # Process emails
         apply_labels = not no_apply_labels
-        result = processor.process_emails(
-            query=query,
-            max_messages=max_messages,
-            apply_labels=apply_labels
-        )
+        
+        if concurrent:
+            # Validate max_concurrent parameter
+            if max_concurrent < 1:
+                click.echo("Error: --max-concurrent must be at least 1", err=True)
+                sys.exit(1)
+            if max_concurrent > 20:
+                click.echo("Warning: High concurrency (>20) may hit rate limits", err=True)
+            
+            click.echo(f"Using concurrent processing (max_concurrent={max_concurrent})")
+            result = asyncio.run(processor.process_emails_concurrent(
+                query=query,
+                max_messages=max_messages,
+                apply_labels=apply_labels,
+                max_concurrent=max_concurrent
+            ))
+        else:
+            click.echo("Using sequential processing")
+            result = processor.process_emails(
+                query=query,
+                max_messages=max_messages,
+                apply_labels=apply_labels
+            )
         
         # Display results
         click.echo("\n" + "="*60)
@@ -98,6 +128,18 @@ def process(ctx, query: Optional[str], max_messages: Optional[int], no_apply_lab
         click.echo(f"Successful categorizations: {result.successful_categorizations}")
         click.echo(f"Failed categorizations: {result.failed_categorizations}")
         click.echo(f"Processing time: {result.processing_time:.2f} seconds")
+        
+        # Show performance metrics
+        if result.total_messages > 0:
+            avg_time_per_email = result.processing_time / result.total_messages
+            click.echo(f"Average time per email: {avg_time_per_email:.2f} seconds")
+            
+            if concurrent:
+                # Estimate sequential time for comparison
+                estimated_sequential_time = avg_time_per_email * result.total_messages
+                if estimated_sequential_time > result.processing_time:
+                    speedup = estimated_sequential_time / result.processing_time
+                    click.echo(f"Estimated speedup: {speedup:.1f}x faster than sequential")
         
         if result.total_messages > 0:
             success_rate = (result.successful_categorizations / result.total_messages) * 100
